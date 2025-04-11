@@ -1,8 +1,8 @@
-# helloworld
+# bv解析
 
-AstrBot 插件模板
+将各类bilibili分享链接（qq小程序，短链等）解析为bv号
 
-A template plugin for AstrBot plugin feature
+传统派就应该使用bv号分享而不是短链接【愤怒喵】
 
 # 支持
 
