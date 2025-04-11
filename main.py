@@ -20,8 +20,6 @@ class BvPlugin(Star):
         self.timeout = 10
         self.bv_pattern = re.compile(r'BV1[A-Za-z0-9]{9}')
 
-    @filter.permission_type(PermissionType.ADMIN)
-    @filter.command("bv")
     @event_message_type(EventMessageType.GROUP_MESSAGE)
     async def bv_get(self, event: AstrMessageEvent):
         """获取链接后解析"""  # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
