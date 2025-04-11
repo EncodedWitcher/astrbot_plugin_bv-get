@@ -39,21 +39,6 @@ class BvPlugin(Star):
         else:
             pass
 
-    """
-        async def on_group_msg(self, msg: GroupMessage):
-            message = msg.raw_message
-            group_uin = msg.group_id
-            bv_id = self.get_from_msg(message)
-            if bv_id:
-                result = self.get_bilibili_video_info(bv_id)
-                if result:  # 避免 None 被解包
-                    title, pic = result
-                    await self.api.add_text(f'{bv_id}\n标题: {title[0]}\n').add_image(pic).send_group_msg(
-                        group_id=group_uin)
-            else:
-                pass
-                # print(f"无法获取 {bv_id} 的视频信息")
-    """
 
     def extract_bv(self, url):
         """
@@ -126,31 +111,57 @@ class BvPlugin(Star):
 
         return False  # 默认返回无效
 
-    def extract_bilibili_shortlink(self, cq_json_str):
-        # 先找到CQ码中的JSON部分
-        match = re.search(r'\[CQ:json,data=(.*?)\]', cq_json_str)
-        if not match:
-            return cq_json_str  # 没找到JSON数据
-        json_str = match.group(1)  # 提取JSON字符串
-        json_str = html.unescape(json_str)
+    def extract_bilibili_shortlink(self, msg_list):
+        """
+        从消息列表中提取 b23 链接
+        """
+        for msg in msg_list:
+            if getattr(msg, "type", "") == "Json":
+                cq_json_str = msg.data
+                match = re.search(r'\[CQ:json,data=(.*?)\]', cq_json_str)
+                if not match:
+                    json_str = cq_json_str
+                else:
+                    json_str = match.group(1)
 
-        # 解析JSON
-        try:
-            data = json.loads(json_str)
-            bilibili_url = data.get("meta", {}).get("detail_1", {}).get("qqdocurl")
-            return bilibili_url
-        except (json.JSONDecodeError, KeyError):
-            return None  # 解析失败或者字段不存在
+                json_str = html.unescape(json_str)
 
-    def get_from_msg(self, msg):
-        bili_url = self.extract_bilibili_shortlink(msg)
+                try:
+                    data = json.loads(json_str)
+                    bilibili_url = data.get("meta", {}).get("detail_1", {}).get("qqdocurl") \
+                                   or data.get("meta", {}).get("news", {}).get("jumpUrl")
+                    return bilibili_url
+                except (json.JSONDecodeError, KeyError):
+                    continue  # 当前消息解析失败，继续尝试下一个
+        return None
+
+    def get_from_msg(self, msg_list):
+        # 先尝试从 Json 类型中提取 URL
+        bili_url = self.extract_bilibili_shortlink(msg_list)
         if bili_url:
             try:
-                bv_id = self.extract_bv(bili_url)
-                return bv_id
-            except Exception as e:
-                # print(f"提取 BV 号时发生错误: {e}")
+                return self.extract_bv(bili_url)
+            except Exception:
                 return None
+
+        # 如果没有 json 内容，就尝试在纯文本中找 BV 号或链接
+        for msg in msg_list:
+            if getattr(msg, "type", "") == "Plain":
+                text = msg.text
+                # 直接找BV号
+                match = self.bv_pattern.search(text)
+                if match:
+                    return match.group()
+                # 尝试从 URL 提取
+                urls = re.findall(r'https?://[^\s]+', text)
+                for url in urls:
+                    try:
+                        bv = self.extract_bv(url)
+                        if bv:
+                            return bv
+                    except Exception:
+                        continue
+        return None
 
     def get_bilibili_video_info(self, bv_id):
         url = f"https://api.bilibili.com/x/web-interface/view?bvid={bv_id}"
