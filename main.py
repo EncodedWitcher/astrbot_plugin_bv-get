@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from urllib.error import URLError, HTTPError
 import html
 
-@register("bv-get", "YourName", "bv号获取插件", "1.0.0")
+@register("bv-get", "YourName", "bv号获取插件", "1.0.1")
 class BvPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
