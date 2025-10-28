@@ -24,7 +24,8 @@ class BvPlugin(Star):
     async def bv_get(self, event: AstrMessageEvent):
         """获取链接后解析"""  # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
         message = event.get_messages()  # 用户发的纯文本消息字符串
-        print(event.get_raw_message()) #test
+        print(event.message_obj.raw_message) # 平台下发的原始消息在这里
+        print(event.message_obj.message) # AstrBot 解析出来的消息链内容
         bv_id = self.get_from_msg(message)
         if bv_id:
             result = self.get_bilibili_video_info(bv_id)
