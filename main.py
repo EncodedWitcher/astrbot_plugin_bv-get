@@ -1,16 +1,14 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-import astrbot.api.message_components as Comp
-from astrbot.core.star.filter.permission import PermissionType
-from astrbot.api.all import *
-
 import re
-import json
-import urllib.request
+import aiohttp
 from urllib.parse import urlparse
-from urllib.error import URLError, HTTPError
 import html
 
-@register("bv-get", "BYSSTED", "bv号获取插件", "1.0.1")
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger
+from astrbot.api.message_components import Json, Plain, Image
+
+@register("bv-get", "BYSSTED", "bv号获取插件", "1.3.0")
 class BvPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -20,170 +18,137 @@ class BvPlugin(Star):
         self.timeout = 10
         self.bv_pattern = re.compile(r'BV1[A-Za-z0-9]{9}')
 
-    @event_message_type(EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def bv_get(self, event: AstrMessageEvent):
-        """获取链接后解析"""  # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        message = event.get_messages()  # 用户发的纯文本消息字符串
-        #print(event.message_obj.raw_message) # 平台下发的原始消息在这里
-        #print(event.message_obj.message) # AstrBot 解析出来的消息链内容
-        bv_id = self.get_from_msg(message)
-        if bv_id:
-            result = self.get_bilibili_video_info(bv_id)
-            if result:  # 避免 None 被解包
-                title, pic = result
-                chain=[
-                    Comp.Plain(f'{bv_id}\n标题: {title[0]}\n'),
-                    Comp.Image.fromURL(pic)
-                ]
-                yield event.chain_result(chain)
-        else:
-            pass
+        """获取 Bilibili 链接并解析"""
+        message_obj = event.message_obj
+        
+        async with aiohttp.ClientSession() as session:
+            bv_id = await self.get_from_msg(message_obj, session)
+            
+            if bv_id:
+                logger.info(f"Found BV ID: {bv_id}")
+                result = await self.get_bilibili_video_info(bv_id, session)
+                if result:
+                    title, pic = result
+                    chain = [
+                        Plain(f'{bv_id}\n标题: {title}\n'),
+                    ]
+                    
+                    # 尝试下载图片并以 bytes 发送，避免 rich media transfer failed
+                    try:
+                        async with session.get(pic, headers=self.headers, timeout=self.timeout) as img_resp:
+                            if img_resp.status == 200:
+                                img_data = await img_resp.read()
+                                chain.append(Image.fromBytes(img_data))
+                            else:
+                                chain.append(Image.fromURL(pic)) # 降级尝试
+                    except Exception as e:
+                        logger.warning(f"Failed to download image: {e}")
+                        chain.append(Image.fromURL(pic)) # 降级尝试
 
+                    yield event.chain_result(chain)
 
-    def extract_bv(self, url):
-        """
-        从给定的Bilibili链接或b23.tv短链接中提取BV号
-        :param url: 分享链接字符串
-        :return: 提取到的BV号（大小写敏感），如果没有找到则返回None
-        """
+    async def get_from_msg(self, message_obj, session: aiohttp.ClientSession):
+        """从消息对象中提取 BV 号"""
+        # 1. 尝试从 JSON 组件（小程序/卡片）中提取
+        for component in message_obj.message:
+            if isinstance(component, Json):
+                bv = await self._extract_from_json(component, session)
+                if bv:
+                    return bv
+        
+        # 2. 尝试从纯文本中提取
+        for component in message_obj.message:
+            if isinstance(component, Plain):
+                bv = await self._extract_from_text(component.text, session)
+                if bv:
+                    return bv
+                    
+        return None
+
+    async def _extract_from_json(self, component: Json, session: aiohttp.ClientSession):
+        """从 JSON 组件通过 raw_link 提取"""
+        try:
+            data = component.data
+            meta = data.get('meta')
+            if not meta:
+                return None
+
+            raw_url = ""
+            if 'detail_1' in meta:
+                raw_url = meta['detail_1'].get('qqdocurl')
+            elif 'news' in meta:
+                raw_url = meta['news'].get('jumpUrl')
+            
+            if raw_url:
+                cleaned_url = raw_url.split('?')[0]
+                return await self.extract_bv(raw_url, session)
+                
+        except Exception as e:
+            logger.error(f"Error extracting from JSON: {e}")
+        return None
+
+    async def _extract_from_text(self, text: str, session: aiohttp.ClientSession):
+        """从文本中提取 BV 号或解析 URL"""
+        match = self.bv_pattern.search(text)
+        if match:
+            return match.group()
+            
+        urls = re.findall(r'https?://[^\s]+', text)
+        for url in urls:
+            bv = await self.extract_bv(url, session)
+            if bv:
+                return bv
+        return None
+
+    async def extract_bv(self, url: str, session: aiohttp.ClientSession):
+        """从 URL 提取 BV 号 (包含短链解析)"""
         if not url:
             return None
-        final_url = self._resolve_short_url(url)
+        
+        final_url = await self._resolve_short_url(url, session)
         return self._extract_bv_from_url(final_url)
 
-    def _resolve_short_url(self, url):
-        """
-        解析b23.tv短链接，返回最终重定向的URL
-        """
-        match = re.search(r"https?://[^\s]+", url)
-        if match:
-            clean_url = match.group(0)
-        else:
-            return url
-        parsed = urlparse(clean_url)
+    async def _resolve_short_url(self, url: str, session: aiohttp.ClientSession):
+        """解析 b23.tv 等短链接"""
+        parsed = urlparse(url)
         if self._is_b23_link(parsed.netloc):
             try:
-                req = urllib.request.Request(clean_url, headers=self.headers)
-                with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                    return response.geturl()
-            except HTTPError as e:
-                print(f"HTTP错误({e.code}): {e.reason}")
-            except URLError as e:
-                print(f"URL错误: {e.reason}")
-            except TimeoutError:
-                print("短链接解析超时")
-            return url
-
+                async with session.get(url, headers=self.headers, timeout=self.timeout, allow_redirects=True) as response:
+                    return str(response.url)
+            except Exception as e:
+                logger.warning(f"Short link resolve error: {e}")
+                return url
         return url
 
-    def _is_b23_link(self, netloc):
-        """判断是否是b23短链接域名"""
+    def _is_b23_link(self, netloc: str):
         return netloc in {'b23.tv', 'www.b23.tv'} or netloc.endswith('.b23.tv')
 
-    def _extract_bv_from_url(self, url):
-        """从URL字符串中提取BV号"""
+    def _extract_bv_from_url(self, url: str):
         match = self.bv_pattern.search(url)
         return match.group() if match else None
 
-    def check_bv_validity(self, bv_id):
-        """
-        检测提取出的BV号是否有效
-        :param bv_id: 提取到的BV号
-        :return: 如果有效返回True，否则返回False
-        """
-        if not bv_id:
-            return False
-
-        api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bv_id}"
-        try:
-            req = urllib.request.Request(api_url, headers=self.headers)
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                return data.get('code', -1) == 0
-        except HTTPError as e:
-            print(f"HTTP错误({e.code}): {e.reason}")
-        except URLError as e:
-            print(f"URL错误: {e.reason}")
-        except TimeoutError:
-            print("API 请求超时")
-        except json.JSONDecodeError:
-            print("JSON 解析错误")
-
-        return False  # 默认返回无效
-
-    def extract_bilibili_shortlink(self, msg_list):
-        """
-        从消息列表中提取 b23 链接
-        """
-        for msg in msg_list:
-            if getattr(msg, "type", "") == "Json":
-                cq_json_str = msg.data
-                match = re.search(r'\[CQ:json,data=(.*?)\]', cq_json_str)
-                if not match:
-                    json_str = cq_json_str
-                else:
-                    json_str = match.group(1)
-
-                json_str = html.unescape(json_str)
-
-                try:
-                    data = json.loads(json_str)
-                    bilibili_url = data.get("meta", {}).get("detail_1", {}).get("qqdocurl") \
-                                   or data.get("meta", {}).get("news", {}).get("jumpUrl")
-                    return bilibili_url
-                except (json.JSONDecodeError, KeyError):
-                    continue  # 当前消息解析失败，继续尝试下一个
-        return None
-
-    def get_from_msg(self, msg_list):
-        # 先尝试从 Json 类型中提取 URL
-        bili_url = self.extract_bilibili_shortlink(msg_list)
-        if bili_url:
-            try:
-                return self.extract_bv(bili_url)
-            except Exception:
-                return None
-
-        # 如果没有 json 内容，就尝试在纯文本中找 BV 号或链接
-        for msg in msg_list:
-            if getattr(msg, "type", "") == "Plain":
-                text = msg.text
-                # 直接找BV号
-                match = self.bv_pattern.search(text)
-                if match:
-                    return match.group()
-                # 尝试从 URL 提取
-                urls = re.findall(r'https?://[^\s]+', text)
-                for url in urls:
-                    try:
-                        bv = self.extract_bv(url)
-                        if bv:
-                            return bv
-                    except Exception:
-                        continue
-        return None
-
-    def get_bilibili_video_info(self, bv_id):
+    async def get_bilibili_video_info(self, bv_id: str, session: aiohttp.ClientSession):
         url = f"https://api.bilibili.com/x/web-interface/view?bvid={bv_id}"
-        request = urllib.request.Request(url, headers=self.headers)
+        
         try:
-            with urllib.request.urlopen(request) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            # 检查 API 响应
+            async with session.get(url, headers=self.headers, timeout=self.timeout) as response:
+                if response.status != 200:
+                    logger.warning(f"Bilibili API returned status: {response.status}")
+                    return None
+                
+                data = await response.json()
+            
             if data.get("code") == 0:
                 video_info = data.get("data", {})
-                title = video_info.get("title", "未知标题"),
+                title = html.unescape(video_info.get("title", "未知标题"))
                 pic = video_info.get("pic", "无封面")
-                # c_data = f">{bv_id}>\n>标题:{title[0]}>\n>[{pic}]"
                 return title, pic
             else:
+                logger.warning(f"Bilibili API returned error code: {data.get('code')}")
                 return None
-
-        except urllib.error.URLError as e:
+                
+        except Exception as e:
+            logger.error(f"Error fetching video info: {e}")
             return None
-
-
-
-
-
